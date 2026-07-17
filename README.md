@@ -1,0 +1,2 @@
+# AgroMind
+Project scaffold.

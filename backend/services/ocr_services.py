@@ -22,6 +22,8 @@ def extract_text_from_images(image_paths):
     for image_path in image_paths:
 
         result = ocr.predict(image_path)
+        
+        print(result)
 
         page_text = ""
 

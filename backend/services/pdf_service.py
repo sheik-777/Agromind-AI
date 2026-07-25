@@ -26,7 +26,7 @@ def convert_pdf_to_images(pdf_path: str, output_folder: str):
     for page_number in range(len(pdf_document)):
         page = pdf_document.load_page(page_number)
 
-        pix = page.get_pixmap(dpi=300)
+        pix = page.get_pixmap(dpi=150)
 
         image_path = os.path.join(
             output_folder,

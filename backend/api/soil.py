@@ -4,6 +4,7 @@ import os
 from backend.services.pdf_service import convert_pdf_to_images
 from backend.services.ocr_services import extract_text_from_images
 from backend.services.parser_service import parse_soil_report
+from backend.services.recommendation_services import recommend_crops
 
 router = APIRouter(
     prefix="/soil",
@@ -11,12 +12,14 @@ router = APIRouter(
 )
 
 UPLOAD_FOLDER = "backend/uploads/pdfs"
+DATASET_PATH = "backend/datasets/agromind_master_dataset_full (1).csv"
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
 @router.post("/upload")
 async def upload_soil_report(file: UploadFile = File(...)):
+
     print("===== STEP 1: Upload endpoint reached =====", flush=True)
 
     file_path = os.path.join(UPLOAD_FOLDER, file.filename)
@@ -61,8 +64,31 @@ async def upload_soil_report(file: UploadFile = File(...)):
         print("=" * 80)
 
         try:
+            # ---------------- PARSER ----------------
             result = parse_soil_report(page)
             print("✅ Parser completed successfully.")
+
+            # ---------------- RECOMMENDATION ENGINE ----------------
+            print("===== STEP 7: Starting Recommendation Engine =====", flush=True)
+
+            recommendations = recommend_crops(
+                result,
+                DATASET_PATH
+            )
+
+            print("✅ Recommendation Engine completed successfully.")
+
+            print("=" * 80)
+            print("TOP 5 CROP RECOMMENDATIONS")
+            print("=" * 80)
+
+            for crop in recommendations:
+                print(f"{crop['crop']}  -->  Score: {crop['score']}")
+
+            print("=" * 80)
+
+            # Attach recommendations to parser output
+            result["crop_recommendations"] = recommendations
 
             parsed_report.append(result)
 
@@ -75,9 +101,9 @@ async def upload_soil_report(file: UploadFile = File(...)):
                 "error": str(e)
             }
 
-    print("===== STEP 7: All pages parsed successfully =====", flush=True)
+    print("===== STEP 8: All pages processed successfully =====", flush=True)
 
-    print("===== STEP 8: Returning response =====", flush=True)
+    print("===== STEP 9: Returning response =====", flush=True)
 
     return {
         "success": True,

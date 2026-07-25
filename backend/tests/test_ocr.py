@@ -1,12 +1,13 @@
 from backend.services.ocr_services import extract_text_from_images
 
-image_paths = [
-    "backend/uploads/images/page_1.png"
+images = [
+    "backend/uploads/images/page_1.png",
+    "backend/uploads/images/page_2.png"
 ]
 
-result = extract_text_from_images(image_paths)
+print("Before OCR")
 
-print("\n========== OCR RESULT ==========\n")
+result = extract_text_from_images(images)
 
-for page in result:
-    print(page)
+print("OCR Finished")
+print(result)

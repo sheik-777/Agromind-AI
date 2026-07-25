@@ -425,36 +425,48 @@ def _split_vertical_header_and_data(
     # Reached the end of the block while still reading headers: no data rows.
     return columns, len(block_lines)
 
+def _is_valid_lab_row(
+    row_tokens: list[str],
+    columns: list[dict[str, Any]]
+) -> bool:
+    """
+    Returns True only if the extracted row structurally matches
+    the Laboratory Analysis table.
+    """
 
+    if len(row_tokens) != len(columns):
+        return False
+
+    for col, token in zip(columns, row_tokens):
+
+        # Sample ID should normally be an integer
+        if col["role"] == "sample":
+            if not token.isdigit():
+                return False
+
+        # Parameter values must be numeric
+        elif col["role"] == "parameter":
+            try:
+                float(token)
+            except ValueError:
+                return False
+
+    return True
 
 def _parse_laboratory_analysis_block(
     block_lines: list[str], warnings: list[str]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Parse one "Laboratory Analysis" table block into per-sample results.
+    """Parse one "Laboratory Analysis" table block into per-sample results."""
 
-    Handles the vertically split layout produced by this OCR pipeline: each
-    header token (including "Sample") occupies its own line, followed by
-    each sample's values one per line, in the same column order as the
-    detected headers, repeating for every subsequent sample row.
-
-    Args:
-        block_lines: Lines belonging to a single Laboratory Analysis table,
-            headers first, one token per line, followed by data values.
-        warnings: Mutable list to append extraction warnings to.
-
-    Returns:
-        Tuple of (samples, unknown_parameters). `samples` is a list of
-        {"sample_id": ..., "parameters": [...]}; `unknown_parameters` holds
-        one entry per header token that could not be matched to
-        SOIL_PARAMETERS or the "Sample" label.
-    """
     if not block_lines:
         return [], []
 
     columns, data_start_idx = _split_vertical_header_and_data(block_lines, warnings)
 
     unknown_parameters = [
-        {"header": col["original_name"]} for col in columns if col["role"] == "unknown"
+        {"header": col["original_name"]}
+        for col in columns
+        if col["role"] == "unknown"
     ]
 
     n_cols = len(columns)
@@ -463,18 +475,46 @@ def _parse_laboratory_analysis_block(
         return [], unknown_parameters
 
     if not any(col["role"] == "parameter" for col in columns):
-        warnings.append("laboratory analysis header contained no recognizable parameters")
+        warnings.append(
+            "laboratory analysis header contained no recognizable parameters"
+        )
 
     data_lines: list[str] = []
+
     for line in block_lines[data_start_idx:]:
-        if _classify_heading(line) is not None:
+
+        upper = line.upper().strip()
+
+        # Stop when the footer begins
+        if (
+            _classify_heading(line) is not None
+            or "WEB COPY" in upper
+            or upper == "PAGE"
+        ):
             break
+
         data_lines.append(line)
 
     samples: list[dict[str, Any]] = []
+
     for row_start in range(0, len(data_lines), n_cols):
+
         row_tokens = data_lines[row_start : row_start + n_cols]
 
+        # Wisconsin reports occasionally lose Sample ID "1" in OCR.
+        # If the first token isn't an integer, assume Sample ID is missing.
+        if row_tokens:
+            try:
+                int(row_tokens[0])
+            except ValueError:
+                row_tokens.insert(0, str(len(samples) + 1))
+
+        # OCR sometimes misses the Sample ID.
+        # If exactly one value is missing, insert the sample number.
+        if len(row_tokens) == n_cols - 1:
+            row_tokens.insert(0, str(len(samples) + 1))
+
+        # If the row is still incomplete, stop parsing.
         if len(row_tokens) < n_cols:
             if row_tokens:
                 warnings.append(
@@ -486,16 +526,19 @@ def _parse_laboratory_analysis_block(
 
         sample_id: Optional[str] = None
         parameters: list[dict[str, Any]] = []
+
         for col, token in zip(columns, row_tokens):
+
             if col["role"] == "sample":
                 sample_id = token
                 continue
+
             if col["role"] == "unknown":
                 continue
 
             key = col["key"]
             definition = SOIL_PARAMETERS[key]
-            value: Any
+
             try:
                 value = float(token)
             except ValueError:
@@ -503,6 +546,7 @@ def _parse_laboratory_analysis_block(
                 warnings.append(
                     f"could not parse numeric value for '{key}' (got '{token}')"
                 )
+
             parameters.append(
                 {
                     "parameter": key,
@@ -510,16 +554,20 @@ def _parse_laboratory_analysis_block(
                     "original_name": col["original_name"],
                     "value": value,
                     "unit": _unit_from_original_name(
-                        col["original_name"], definition["unit"]
+                        col["original_name"],
+                        definition["unit"],
                     ),
                 }
             )
 
-        samples.append({"sample_id": sample_id, "parameters": parameters})
+        samples.append(
+            {
+                "sample_id": sample_id,
+                "parameters": parameters,
+            }
+        )
 
     return samples, unknown_parameters
-
-
 def _extract_laboratory_analysis(
     lines: list[str], warnings: list[str]
 ) -> dict[str, Any]:

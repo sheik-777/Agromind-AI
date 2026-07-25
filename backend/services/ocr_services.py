@@ -1,38 +1,43 @@
-from paddleocr import PaddleOCR
+import easyocr
 
-# Load the OCR model once when the backend starts
-ocr = PaddleOCR(
-    lang="en",
-    enable_mkldnn=False
-)
+# Initialize EasyOCR Reader once when the application starts
+# Using CPU because CUDA is not available on your system.
+reader = easyocr.Reader(['en'])
 
 def extract_text_from_images(image_paths):
     """
-    Reads text from one or more images.
+    Extract text from a list of image paths using EasyOCR.
 
     Parameters:
         image_paths (list): List of image file paths.
 
     Returns:
-        list: Extracted text for each page.
+        list: A list where each element contains the extracted text
+              from one image/page.
     """
+
+    print("Entered extract_text_from_images()", flush=True)
 
     extracted_pages = []
 
     for image_path in image_paths:
 
-        result = ocr.predict(image_path)
-        
-        print(result)
+        print(f"Processing image: {image_path}", flush=True)
 
-        page_text = ""
+        try:
+            # detail=0 returns only the recognized text
+            result = reader.readtext(image_path, detail=0)
 
-        for block in result:
+            print("OCR returned successfully", flush=True)
 
-            if "rec_texts" in block:
+            page_text = "\n".join(result)
 
-                page_text += "\n".join(block["rec_texts"])
+            extracted_pages.append(page_text)
 
-        extracted_pages.append(page_text)
+        except Exception as e:
+            print(f"OCR Error: {e}", flush=True)
+            extracted_pages.append("")
+
+    print("Leaving extract_text_from_images()", flush=True)
 
     return extracted_pages

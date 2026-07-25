@@ -1,722 +1,691 @@
 """
 recommendation_services.py
-===========================================================
-AgroMind - Rule-Based Crop Recommendation Engine
-===========================================================
 
-This module is the core recommendation service for AgroMind. It ingests a
-structured soil test report (already OCR-extracted and parsed upstream) and
-compares it against a master crop dataset of ~1200 crops using a weighted,
-rule-based scoring model. It returns the Top 5 most suitable crops with a
-full breakdown of parameter-level scores, environmental requirements, and a
-dynamically generated human-readable summary.
+AgroMind Precision Agriculture Decision Support Platform
+---------------------------------------------------------
 
-No machine learning is used. This is a deterministic, explainable expert
-system, which is a deliberate design choice for an agricultural advisory
-context where farmers and agronomists need to trust and audit every score.
+A deterministic, rule-based crop recommendation engine.
 
------------------------------------------------------------------------------
-IMPORTANT DATA MAPPING NOTE (read before deploying)
------------------------------------------------------------------------------
-The soil report schema scores five parameters: nitrogen, phosphorus,
-potassium, ph, and organic_matter. The master dataset schema supplied in the
-project spec defines range columns for nitrogen, phosphorus, potassium, and
-ph, but does NOT define an explicit `organic_matter_min` / `organic_matter_max`
-column pair -- the only remaining unmapped soil-range columns in the dataset
-are `moisture_min` / `moisture_max`.
+The engine consumes the structured JSON produced by the existing OCR / PDF /
+soil-report parser and cross-references it against a master crop dataset to
+produce a ranked list of the top matching crops.
 
-Because organic matter is a required, weighted (10%) scoring dimension and
-cannot be silently dropped, this module maps `organic_matter` to the
-dataset's `moisture_min` / `moisture_max` columns as the closest available
-proxy for organic content requirements. This mapping is isolated to a single
-constant (`ORGANIC_MATTER_DATASET_COLUMNS`) so that if/when the dataset is
-updated with true `organic_matter_min` / `organic_matter_max` columns, only
-that one constant needs to change -- no scoring logic is affected.
+Pipeline position
+------------------
+    PDF upload -> FastAPI -> images -> EasyOCR -> parser -> JSON
+        -> recommendation_services.recommend_crops() -> top-5 crops -> API response
+
+This module is a drop-in replacement for the existing recommendation
+service. It exposes the same public function signature so it can be
+integrated without touching the parser or the FastAPI routes.
+
+Design principles
+------------------
+1. Parameter agnostic:
+   The engine never assumes a soil report contains every supported
+   parameter. Whatever subset of {nitrogen, phosphorus, potassium, ph}
+   is present is used; missing parameters are simply skipped. A report
+   containing only pH must still produce recommendations.
+
+2. Dynamic weight normalization:
+   The original weight distribution (N=35, P=25, K=20, pH=20) is
+   renormalized to 100 across only the parameters that are actually
+   present in a given report, so a report is never penalized for a
+   parameter the laboratory did not measure.
+
+3. Deterministic, rule-based scoring:
+   No machine learning is used. Every crop's parameter values are
+   compared against the crop's ideal range from the dataset, and a
+   distance-based percentage score is computed.
+
+4. Organic Matter is explicitly unsupported for scoring:
+   The dataset does not contain organic matter ranges, so this
+   parameter is recognized (in case the parser reports it) but never
+   participates in crop ranking.
+
+5. Environment fields are derived, not stored:
+   The dataset stores temp_min/temp_max, humidity_min/humidity_max,
+   and rain_min/rain_max rather than pre-formatted strings. This
+   module formats them into the display strings the frontend expects
+   (e.g. "20-30°C", "60-80%", "800-1200 mm/year").
+
+Public API
+----------
+    recommend_crops(soil_report_json: dict, dataset_path: str) -> List[dict]
+
+Everything else in this module is an internal implementation detail.
 """
 
 from __future__ import annotations
 
-import json
-import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, Iterable, List, Tuple
 
 import pandas as pd
 
-logger = logging.getLogger("agromind.recommendation_services")
-logger.addHandler(logging.NullHandler())
-
-# =============================================================================
+# =====================================================================
 # CONSTANTS
-# =============================================================================
+# =====================================================================
 
-DEFAULT_DATASET_PATH: str = "datasets/agromind_master_dataset_full.csv"
+#: Parameters the scoring engine is able to evaluate. Order is not
+#: significant; presence in this tuple is what defines "supported".
+SUPPORTED_PARAMETERS: Tuple[str, ...] = ("nitrogen", "phosphorus", "potassium", "ph")
 
-#: Weight assigned to each scored soil parameter. Must sum to 100.
-PARAMETER_WEIGHTS: Dict[str, float] = {
+#: Parameters that may be reported by the parser but must never
+#: participate in crop scoring (no dataset ranges exist for them).
+UNSUPPORTED_PARAMETERS: Tuple[str, ...] = ("organic_matter",)
+
+#: Original (pre-normalization) weight distribution. Must sum to 100.
+ORIGINAL_WEIGHTS: Dict[str, float] = {
     "nitrogen": 35.0,
     "phosphorus": 25.0,
     "potassium": 20.0,
     "ph": 20.0,
 }
 
-#: Maps a soil_data parameter name to the (min_column, max_column) pair in
-#: the crop dataset used to evaluate it. See module docstring for the
-#: organic_matter -> moisture mapping rationale.
-PARAMETER_DATASET_COLUMNS: Dict[str, Tuple[str, str]] = {
+#: Physical plausibility limits used purely for input validation.
+#: Values outside these ranges are treated as invalid measurements
+#: rather than legitimate agronomic extremes.
+PHYSICAL_LIMITS: Dict[str, Tuple[float, float]] = {
+    "nitrogen": (0.0, 1000.0),
+    "phosphorus": (0.0, 1000.0),
+    "potassium": (0.0, 2000.0),
+    "ph": (0.0, 14.0),
+}
+
+#: Rating thresholds shared by both per-parameter and overall crop scores.
+RATING_THRESHOLDS: Tuple[Tuple[float, str], ...] = (
+    (90.0, "Excellent"),
+    (75.0, "Good"),
+    (50.0, "Moderate"),
+    (0.0, "Poor"),
+)
+
+#: Maps an overall match rating to a confidence label surfaced to the user.
+CONFIDENCE_BY_MATCH: Dict[str, str] = {
+    "Excellent": "Highly Recommended",
+    "Good": "Recommended",
+    "Moderate": "Consider with Caution",
+    "Poor": "Not Recommended",
+}
+
+#: Dataset columns holding each supported soil parameter's ideal range.
+_SOIL_RANGE_COLUMNS: Dict[str, Tuple[str, str]] = {
     "nitrogen": ("nitrogen_min", "nitrogen_max"),
     "phosphorus": ("phosphorus_min", "phosphorus_max"),
     "potassium": ("potassium_min", "potassium_max"),
     "ph": ("ph_min", "ph_max"),
 }
 
-#: All columns required to be present in the dataset for the engine to run.
-REQUIRED_DATASET_COLUMNS: List[str] = [
-    "crop",
-    "soil_type",
-    "nitrogen_min", "nitrogen_max",
-    "phosphorus_min", "phosphorus_max",
-    "potassium_min", "potassium_max",
-    "ph_min", "ph_max",
-    "temp_min", "temp_max",
-    "humidity_min", "humidity_max",
-    "rain_min", "rain_max",
-    "moisture_min", "moisture_max",
-    "season",
-]
-
-#: Required keys in the incoming parsed soil_data payload.
-REQUIRED_SOIL_KEYS: List[str] = [
-    "nitrogen", "phosphorus", "potassium", "ph",
-]
-
-#: Sane physical bounds used purely for input sanity-checking (not scoring).
-SOIL_VALUE_SANITY_BOUNDS = {
-    "nitrogen": (0.0, 1000.0),
-    "phosphorus": (0.0, 1000.0),
-    "potassium": (0.0, 1000.0),
-    "ph": (0.0, 14.0),
+#: Dataset columns holding each derived environment field's ideal range,
+#: paired with the unit suffix used when formatting the display string.
+_ENVIRONMENT_RANGE_COLUMNS: Dict[str, Tuple[str, str, str]] = {
+    "temperature": ("temp_min", "temp_max", "\u00b0C"),
+    "humidity": ("humidity_min", "humidity_max", "%"),
+    "rainfall": ("rain_min", "rain_max", " mm/year"),
 }
 
-TOP_N_RESULTS: int = 5
+#: Dataset columns that are copied as plain strings into the environment block.
+_ENVIRONMENT_DIRECT_COLUMNS: Tuple[str, ...] = ("soil_type", "season")
 
-# Distance-from-range tiers -> percentage credit awarded.
-# Ordered as (upper_bound_of_distance_percentage, percentage_awarded).
-DISTANCE_SCORING_TIERS: List[Tuple[float, float]] = [
-    (0.0, 100.0),   # inside range
-    (5.0, 90.0),    # 0-5% outside
-    (10.0, 75.0),   # 5-10% outside
-    (20.0, 50.0),   # 10-20% outside
-    (math.inf, 0.0),  # more than 20% outside
-]
+_TOP_N_RESULTS = 5
 
 
-# =============================================================================
+# =====================================================================
 # DATA STRUCTURES
-# =============================================================================
+# =====================================================================
 
 @dataclass(frozen=True)
-class ParameterScoreResult:
-    """Container for a single parameter's scoring outcome."""
+class ParameterReading:
+    """A single validated soil parameter reading extracted from a report."""
 
-    score: float
-    max_score: float
-    percentage: float
-    status: str
-
-    current_value: float
-    ideal_min: float
-    ideal_max: float
-
-    comparison: str
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "score": round(self.score, 2) if self.score % 1 else int(self.score),
-            "max_score": int(self.max_score) if self.max_score % 1 == 0 else self.max_score,
-            "percentage": round(self.percentage, 2) if self.percentage % 1 else int(self.percentage),
-            "status": self.status,
-            "current_value": self.current_value,
-            "ideal_min": self.ideal_min,
-            "ideal_max": self.ideal_max,
-            "comparison": self.comparison,
-        }
+    name: str
+    value: float
 
 
-# =============================================================================
-# EXCEPTIONS
-# =============================================================================
+@dataclass(frozen=True)
+class CropScore:
+    """The scored result for one crop, prior to final JSON assembly."""
 
-class DatasetError(Exception):
-    """Raised when the crop dataset cannot be loaded or is structurally invalid."""
-
-
-class SoilDataValidationError(Exception):
-    """Raised when the incoming parsed soil_data payload fails validation."""
+    crop_name: str
+    overall_score: float
+    parameter_scores: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    crop_row: pd.Series = field(repr=False, compare=False, default=None)
 
 
-# =============================================================================
+# =====================================================================
 # DATASET LOADING
-# =============================================================================
+# =====================================================================
 
-@lru_cache(maxsize=4)
-def load_crop_dataset(dataset_path: str = DEFAULT_DATASET_PATH) -> pd.DataFrame:
+@lru_cache(maxsize=8)
+def _load_dataset(dataset_path: str) -> pd.DataFrame:
+    """Load and cache the master crop dataset from disk.
+
+    The dataset is small enough (~1200 rows) to keep fully in memory,
+    and is cached by path so repeated calls to ``recommend_crops`` do
+    not repeatedly hit disk.
+
+    Args:
+        dataset_path: Path to the CSV dataset.
+
+    Returns:
+        The dataset as a pandas DataFrame with normalized column names.
+
+    Raises:
+        FileNotFoundError: If the dataset file does not exist.
+        ValueError: If required columns are missing from the dataset.
     """
-    Load and validate the master crop dataset from disk.
+    resolved_path = Path(dataset_path)
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Crop dataset not found at '{resolved_path}'.")
 
-    The result is cached per dataset_path so repeated recommendation calls
-    within the same process do not re-read the CSV from disk each time.
+    dataframe = pd.read_csv(resolved_path)
+    dataframe.columns = [column.strip().lower() for column in dataframe.columns]
+    _validate_dataset_columns(dataframe)
+    return dataframe
 
-    :param dataset_path: Filesystem path to the crop dataset CSV.
-    :return: A validated, numeric-coerced pandas DataFrame.
-    :raises DatasetError: If the file is missing, unreadable, empty, missing
-        required columns, or contains no usable rows after cleaning.
+
+def _validate_dataset_columns(dataframe: pd.DataFrame) -> None:
+    """Ensure the dataset contains every column the engine depends on.
+
+    Args:
+        dataframe: The loaded crop dataset.
+
+    Raises:
+        ValueError: If any required column is missing.
     """
-    try:
-        df = pd.read_csv(dataset_path)
-    except FileNotFoundError as exc:
-        raise DatasetError(f"Crop dataset not found at path: {dataset_path}") from exc
-    except pd.errors.EmptyDataError as exc:
-        raise DatasetError(f"Crop dataset at {dataset_path} is empty.") from exc
-    except pd.errors.ParserError as exc:
-        raise DatasetError(f"Crop dataset at {dataset_path} could not be parsed as CSV.") from exc
+    required_columns = {"crop", *_ENVIRONMENT_DIRECT_COLUMNS}
 
-    if df.empty:
-        raise DatasetError(f"Crop dataset at {dataset_path} contains no rows.")
+    for min_col, max_col in _SOIL_RANGE_COLUMNS.values():
+        required_columns.update((min_col, max_col))
 
-    missing_columns = [col for col in REQUIRED_DATASET_COLUMNS if col not in df.columns]
+    for min_col, max_col, _ in _ENVIRONMENT_RANGE_COLUMNS.values():
+        required_columns.update((min_col, max_col))
+
+    missing_columns = required_columns.difference(dataframe.columns)
     if missing_columns:
-        raise DatasetError(
-            f"Crop dataset is missing required columns: {missing_columns}"
+        raise ValueError(
+            f"Crop dataset is missing required columns: {sorted(missing_columns)}"
         )
 
-    numeric_columns = [
-        col for col in REQUIRED_DATASET_COLUMNS
-        if col not in ("crop", "soil_type", "season")
+
+# =====================================================================
+# SOIL REPORT PARSING
+# =====================================================================
+
+def _extract_raw_parameters(soil_report_json: dict) -> Dict[str, List[float]]:
+    """Collect raw numeric readings per parameter across all samples.
+
+    Multiple samples for the same parameter are gathered so their
+    values can later be averaged, which keeps the engine robust to
+    reports containing more than one lab sample.
+
+    Args:
+        soil_report_json: The parser's structured output.
+
+    Returns:
+        A mapping of parameter name to the list of raw values found
+        for it across all samples.
+    """
+    readings_by_parameter: Dict[str, List[float]] = {}
+
+    samples = soil_report_json.get("laboratory_analysis", {}).get("samples", [])
+    for sample in samples:
+        for parameter_entry in sample.get("parameters", []):
+            parameter_name = str(parameter_entry.get("parameter", "")).strip().lower()
+            if parameter_name not in SUPPORTED_PARAMETERS:
+                continue
+
+            raw_value = parameter_entry.get("value")
+            readings_by_parameter.setdefault(parameter_name, []).append(raw_value)
+
+    return readings_by_parameter
+
+
+def _is_valid_numeric(value: object) -> bool:
+    """Check whether a value is a real, finite number.
+
+    Args:
+        value: The raw value to check.
+
+    Returns:
+        True if the value is a finite int or float, False otherwise.
+    """
+    if isinstance(value, bool):
+        return False
+    if not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
+
+
+def _validate_and_average(
+    readings_by_parameter: Dict[str, List[float]]
+) -> Dict[str, float]:
+    """Validate raw readings and collapse repeated samples into one value.
+
+    A reading is discarded if it is non-numeric, non-finite, negative,
+    or outside its physically plausible range. Surviving readings for
+    the same parameter are averaged.
+
+    Args:
+        readings_by_parameter: Raw values grouped by parameter name.
+
+    Returns:
+        A mapping of parameter name to a single validated value.
+
+    Raises:
+        ValueError: If no supported parameter has any valid reading.
+    """
+    validated_readings: List[ParameterReading] = []
+
+    for parameter_name, raw_values in readings_by_parameter.items():
+        lower_limit, upper_limit = PHYSICAL_LIMITS[parameter_name]
+        valid_values = [
+            float(value)
+            for value in raw_values
+            if _is_valid_numeric(value) and lower_limit <= value <= upper_limit
+        ]
+
+        if valid_values:
+            averaged_value = sum(valid_values) / len(valid_values)
+            validated_readings.append(ParameterReading(parameter_name, averaged_value))
+
+    if not validated_readings:
+        raise ValueError(
+            "The soil report does not contain any valid, supported parameters "
+            f"(supported parameters: {', '.join(SUPPORTED_PARAMETERS)})."
+        )
+
+    return {reading.name: reading.value for reading in validated_readings}
+
+
+def _extract_available_parameters(soil_report_json: dict) -> Dict[str, float]:
+    """Extract, validate, and average supported parameters from a report.
+
+    Args:
+        soil_report_json: The parser's structured output.
+
+    Returns:
+        A mapping of supported parameter name to its validated value.
+
+    Raises:
+        ValueError: If the report contains no valid supported parameters.
+    """
+    raw_readings = _extract_raw_parameters(soil_report_json)
+    return _validate_and_average(raw_readings)
+
+
+# =====================================================================
+# DYNAMIC WEIGHT NORMALIZATION
+# =====================================================================
+
+def _normalize_weights(available_parameters: Iterable[str]) -> Dict[str, float]:
+    """Redistribute the original weights across only the available parameters.
+
+    Args:
+        available_parameters: Parameter names present in the current report.
+
+    Returns:
+        A mapping of parameter name to its normalized weight, summing to 100.
+    """
+    available_parameters = list(available_parameters)
+    total_available_weight = sum(
+        ORIGINAL_WEIGHTS[parameter] for parameter in available_parameters
+    )
+
+    return {
+        parameter: (ORIGINAL_WEIGHTS[parameter] / total_available_weight) * 100.0
+        for parameter in available_parameters
+    }
+
+
+# =====================================================================
+# PARAMETER SCORING
+# =====================================================================
+
+def _rating_for_score(score: float) -> str:
+    """Map a 0-100 score to its qualitative rating label.
+
+    Args:
+        score: A percentage score between 0 and 100.
+
+    Returns:
+        One of "Excellent", "Good", "Moderate", or "Poor".
+    """
+    for threshold, label in RATING_THRESHOLDS:
+        if score >= threshold:
+            return label
+    return "Poor"
+
+
+def _score_against_range(value: float, minimum: float, maximum: float) -> float:
+    """Score how well a value fits inside an ideal [minimum, maximum] range.
+
+    A value inside the range scores 100. A value outside the range is
+    penalized proportionally to its distance from the nearest boundary,
+    relative to the width of the range, floored at 0.
+
+    Args:
+        value: The measured parameter value.
+        minimum: The ideal range's lower bound.
+        maximum: The ideal range's upper bound.
+
+    Returns:
+        A percentage score between 0.0 and 100.0.
+    """
+    if minimum <= value <= maximum:
+        return 100.0
+
+    range_width = maximum - minimum
+    if range_width <= 0:
+        range_width = maximum if maximum > 0 else 1.0
+
+    distance = (minimum - value) if value < minimum else (value - maximum)
+    score = 100.0 - (distance / range_width) * 100.0
+    return max(0.0, score)
+
+
+def _score_parameter(
+    parameter_name: str, value: float, crop_row: pd.Series
+) -> Dict[str, object]:
+    """Score a single parameter reading against a crop's ideal range.
+
+    Args:
+        parameter_name: One of the supported parameter names.
+        value: The validated soil reading for this parameter.
+        crop_row: The dataset row for the crop being evaluated.
+
+    Returns:
+        A dictionary describing the value, ideal range, score, and rating.
+    """
+    min_column, max_column = _SOIL_RANGE_COLUMNS[parameter_name]
+    ideal_min = float(crop_row[min_column])
+    ideal_max = float(crop_row[max_column])
+
+    score = _score_against_range(value, ideal_min, ideal_max)
+
+    return {
+        "value": round(value, 2),
+        "ideal_range": [ideal_min, ideal_max],
+        "score": round(score, 2),
+        "rating": _rating_for_score(score),
+    }
+
+
+# =====================================================================
+# CROP SCORING
+# =====================================================================
+
+def _score_crop(
+    crop_row: pd.Series,
+    soil_values: Dict[str, float],
+    normalized_weights: Dict[str, float],
+) -> CropScore:
+    """Compute a crop's overall weighted score and per-parameter breakdown.
+
+    Args:
+        crop_row: The dataset row for the crop being evaluated.
+        soil_values: Validated soil parameter values from the report.
+        normalized_weights: Weight (summing to 100) for each available parameter.
+
+    Returns:
+        A CropScore holding the crop's name, overall score, per-parameter
+        breakdown, and a reference to its dataset row.
+    """
+    parameter_scores: Dict[str, Dict[str, object]] = {}
+    weighted_total = 0.0
+
+    for parameter_name, value in soil_values.items():
+        parameter_result = _score_parameter(parameter_name, value, crop_row)
+        parameter_scores[parameter_name] = parameter_result
+
+        weight = normalized_weights[parameter_name]
+        weighted_total += (parameter_result["score"] * weight) / 100.0
+
+    return CropScore(
+        crop_name=str(crop_row["crop"]),
+        overall_score=weighted_total,
+        parameter_scores=parameter_scores,
+        crop_row=crop_row,
+    )
+
+
+def _score_all_crops(
+    dataset: pd.DataFrame,
+    soil_values: Dict[str, float],
+    normalized_weights: Dict[str, float],
+) -> List[CropScore]:
+    """Score every crop in the dataset against the report's soil values.
+
+    Args:
+        dataset: The full master crop dataset.
+        soil_values: Validated soil parameter values from the report.
+        normalized_weights: Weight (summing to 100) for each available parameter.
+
+    Returns:
+        A list of CropScore results, one per dataset row.
+    """
+    return [
+        _score_crop(crop_row, soil_values, normalized_weights)
+        for _, crop_row in dataset.iterrows()
     ]
 
-    for col in numeric_columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["crop"] = df["crop"].astype(str).str.strip()
+def _deduplicate_and_rank(crop_scores: List[CropScore]) -> List[CropScore]:
+    """Keep only each crop's best-scoring entry, ranked highest first.
 
-    before_count = len(df)
-    df = df.dropna(subset=numeric_columns + ["crop"])
-    df = df[df["crop"] != ""]
-    dropped = before_count - len(df)
-    if dropped > 0:
-        logger.warning(
-            "Dropped %d row(s) from crop dataset due to missing/invalid numeric "
-            "values or missing crop name.",
-            dropped,
-        )
+    When the same crop name appears multiple times (e.g. across
+    different soil types in the dataset), only its highest-scoring
+    entry is retained.
 
-    invalid_range_mask = (
-        (df["nitrogen_min"] > df["nitrogen_max"]) |
-        (df["phosphorus_min"] > df["phosphorus_max"]) |
-        (df["potassium_min"] > df["potassium_max"]) |
-        (df["ph_min"] > df["ph_max"]) |
-        (df["moisture_min"] > df["moisture_max"])
-    )
-    if invalid_range_mask.any():
-        logger.warning(
-            "Dropped %d row(s) from crop dataset due to inverted min/max ranges.",
-            int(invalid_range_mask.sum()),
-        )
-        df = df[~invalid_range_mask]
+    Args:
+        crop_scores: Every scored crop, including duplicates.
 
-    if df.empty:
-        raise DatasetError(
-            f"Crop dataset at {dataset_path} had no valid rows after cleaning."
-        )
-
-    return df.reset_index(drop=True)
-
-
-# =============================================================================
-# SOIL DATA VALIDATION
-# =============================================================================
-
-def validate_soil_data(soil_data: Dict[str, Any]) -> Dict[str, float]:
+    Returns:
+        The deduplicated crop scores, sorted in descending order.
     """
-    Validate and normalize the parsed soil_data payload.
+    best_score_by_crop: Dict[str, CropScore] = {}
 
-    :param soil_data: Raw dict, expected to contain a "soil_parameters" key
-        (per the parser's documented output) OR the flat parameter keys
-        directly. Both shapes are accepted for robustness.
-    :return: A dict of the five soil parameters as clean floats.
-    :raises SoilDataValidationError: If required keys are missing, values are
-        non-numeric, negative, or outside sane physical bounds.
-    """
-    if not isinstance(soil_data, dict):
-        raise SoilDataValidationError(
-            f"soil_data must be a dict, got {type(soil_data).__name__}."
-        )
+    for candidate in crop_scores:
+        existing = best_score_by_crop.get(candidate.crop_name)
+        if existing is None or candidate.overall_score > existing.overall_score:
+            best_score_by_crop[candidate.crop_name] = candidate
 
-    parameters = soil_data.get("soil_parameters", soil_data)
-    if not isinstance(parameters, dict):
-        raise SoilDataValidationError(
-            "soil_data['soil_parameters'] must be a dict of soil parameter values."
-        )
-
-    missing_keys = [key for key in REQUIRED_SOIL_KEYS if key not in parameters]
-    if missing_keys:
-        raise SoilDataValidationError(
-            f"soil_data is missing required parameter(s): {missing_keys}"
-        )
-
-    validated: Dict[str, float] = {}
-    for key in REQUIRED_SOIL_KEYS:
-        raw_value = parameters[key]
-
-        if raw_value is None:
-            raise SoilDataValidationError(f"soil parameter '{key}' is missing (null).")
-
-        if isinstance(raw_value, bool):
-            raise SoilDataValidationError(
-                f"soil parameter '{key}' must be numeric, got boolean."
-            )
-
-        try:
-            value = float(raw_value)
-        except (TypeError, ValueError) as exc:
-            raise SoilDataValidationError(
-                f"soil parameter '{key}' must be numeric, got: {raw_value!r}"
-            ) from exc
-
-        if math.isnan(value) or math.isinf(value):
-            raise SoilDataValidationError(
-                f"soil parameter '{key}' has an invalid numeric value: {raw_value!r}"
-            )
-
-        if value < 0:
-            raise SoilDataValidationError(
-                f"soil parameter '{key}' cannot be negative, got: {value}"
-            )
-
-        lower_bound, upper_bound = SOIL_VALUE_SANITY_BOUNDS[key]
-        if not (lower_bound <= value <= upper_bound):
-            raise SoilDataValidationError(
-                f"soil parameter '{key}' value {value} is outside plausible "
-                f"bounds [{lower_bound}, {upper_bound}]."
-            )
-
-        validated[key] = value
-
-    return validated
+    ranked_scores = list(best_score_by_crop.values())
+    ranked_scores.sort(key=lambda item: item.overall_score, reverse=True)
+    return ranked_scores
 
 
-# =============================================================================
-# SCORING PRIMITIVES
-# =============================================================================
-
-def calculate_distance_percentage(value: float, min_val: float, max_val: float) -> float:
-    """
-    Calculate how far a value lies outside an acceptable [min_val, max_val]
-    range, expressed as a percentage of the range's span.
-
-    Returns 0.0 if the value lies inside the range (inclusive).
-
-    :param value: The measured soil value.
-    :param min_val: Lower bound of the crop's acceptable range.
-    :param max_val: Upper bound of the crop's acceptable range.
-    :return: Non-negative percentage distance from the nearest boundary.
-    """
-    if min_val <= value <= max_val:
-        return 0.0
-
-    range_span = max_val - min_val
-    if range_span <= 0:
-        # Degenerate range (min == max, or invalid). Fall back to comparing
-        # the absolute distance against the boundary value itself so we
-        # never divide by zero and still produce a meaningful signal.
-        reference = max_val if max_val != 0 else 1.0
-        distance = abs(value - max_val)
-        return (distance / abs(reference)) * 100.0
-
-    distance = (min_val - value) if value < min_val else (value - max_val)
-    return (distance / range_span) * 100.0
-
-
-def _distance_to_percentage_score(distance_percentage: float) -> float:
-    """Map a distance-from-range percentage to its awarded percentage score."""
-    for upper_bound, awarded_percentage in DISTANCE_SCORING_TIERS:
-        if distance_percentage <= upper_bound:
-            return awarded_percentage
-    return 0.0  # unreachable given math.inf sentinel, kept for safety
-
-
-def score_parameter(
-    value: float, min_val: float, max_val: float, weight: float
-) -> ParameterScoreResult:
-    """
-    Score a single soil parameter against a crop's acceptable range.
-
-    :param value: The farmer's measured soil value for this parameter.
-    :param min_val: Crop's minimum acceptable value.
-    :param max_val: Crop's maximum acceptable value.
-    :param weight: Maximum score (weight) allotted to this parameter.
-    :return: A ParameterScoreResult with score, max_score, percentage, status.
-    """
-    distance_percentage = calculate_distance_percentage(value, min_val, max_val)
-    awarded_percentage = _distance_to_percentage_score(distance_percentage)
-    score = weight * (awarded_percentage / 100.0)
-    status = parameter_status(awarded_percentage)
-
-# Determine whether the value is below, within, or above the ideal range
-    if value < min_val:
-      comparison = "below"
-    elif value > max_val:
-      comparison = "above"
-    else:
-       comparison = "within"
-
-    return ParameterScoreResult(
-    score=score,
-    max_score=weight,
-    percentage=awarded_percentage,
-    status=status,
-    current_value=value,
-    ideal_min=min_val,
-    ideal_max=max_val,
-    comparison=comparison,
-)
-
-
-def parameter_status(percentage: float) -> str:
-    """
-    Convert a parameter's awarded percentage score into a status label.
-
-    :param percentage: Awarded percentage score (0-100).
-    :return: One of "Excellent", "Good", "Moderate", "Poor".
-    """
-    if percentage >= 100:
-        return "Excellent"
-    if percentage >= 90:
-        return "Good"
-    if percentage >= 50:
-        return "Moderate"
-    return "Poor"
-
-
-# =============================================================================
-# SCORE -> LABEL CONVERTERS
-# =============================================================================
-
-def score_to_stars(score: float) -> int:
-    """Convert an overall suitability score (0-100) into a 1-5 star rating."""
-    if score >= 90:
-        return 5
-    if score >= 80:
-        return 4
-    if score >= 70:
-        return 3
-    if score >= 60:
-        return 2
-    return 1
-
-
-def score_to_match(score: float) -> str:
-    """Convert an overall suitability score (0-100) into a match label."""
-    if score >= 90:
-        return "Excellent"
-    if score >= 80:
-        return "Very Good"
-    if score >= 70:
-        return "Good"
-    if score >= 60:
-        return "Fair"
-    return "Poor"
-
-
-def score_to_confidence(score: float) -> str:
-    """Convert an overall suitability score (0-100) into a confidence label."""
-    if score >= 90:
-        return "Highly Recommended"
-    if score >= 80:
-        return "Recommended"
-    if score >= 70:
-        return "Suitable"
-    if score >= 60:
-        return "Moderately Suitable"
-    return "Low Suitability"
-
-
-# =============================================================================
+# =====================================================================
 # SUMMARY GENERATION
-# =============================================================================
+# =====================================================================
 
-_STRENGTH_TEMPLATES: Dict[str, Dict[str, str]] = {
-    "nitrogen": {
-        "Excellent": "Nitrogen is within the ideal range.",
-        "Good": "Nitrogen is close to the ideal range for this crop.",
-    },
-    "phosphorus": {
-        "Excellent": "Phosphorus levels are perfectly suited for this crop.",
-        "Good": "Phosphorus levels are close to suitable for this crop.",
-    },
-    "potassium": {
-        "Excellent": "Potassium is within the ideal range.",
-        "Good": "Potassium is suitable for optimal growth.",
-    },
-    "ph": {
-        "Excellent": "Soil pH perfectly matches crop requirements.",
-        "Good": "Soil pH is close to the crop's preferred range.",
-    },
-    
-}
-
-_IMPROVEMENT_TEMPLATES: Dict[str, Dict[str, Dict[str, str]]] = {
-    "nitrogen": {
-        "below": {
-            "Moderate": "Increase nitrogen slightly using organic manure or urea.",
-            "Poor": "Nitrogen is critically low. Apply nitrogen-rich fertilizers such as urea or compost."
-        },
-        "above": {
-            "Moderate": "Nitrogen is slightly higher than recommended. Reduce nitrogen fertilizer application.",
-            "Poor": "Nitrogen is excessively high. Avoid applying additional nitrogen fertilizers."
-        }
-    },
-
-    "phosphorus": {
-        "below": {
-            "Moderate": "Increase phosphorus slightly using SSP or DAP fertilizer.",
-            "Poor": "Phosphorus is critically low. Apply phosphorus-rich fertilizers before cultivation."
-        },
-        "above": {
-            "Moderate": "Phosphorus is slightly above the ideal range. Avoid adding phosphorus fertilizer.",
-            "Poor": "Phosphorus is excessively high. Stop phosphate fertilizer application until levels normalize."
-        }
-    },
-
-    "potassium": {
-        "below": {
-            "Moderate": "Increase potassium slightly using MOP or wood ash.",
-            "Poor": "Potassium is critically low. Apply potassium-rich fertilizers before cultivation."
-        },
-        "above": {
-            "Moderate": "Potassium is slightly above the ideal range. Reduce potassium fertilizer application.",
-            "Poor": "Potassium is excessively high. Avoid additional potassium fertilizers."
-        }
-    },
-
-    "ph": {
-        "below": {
-            "Moderate": "The soil is slightly acidic. Apply agricultural lime to raise the pH.",
-            "Poor": "The soil is highly acidic. Correct the pH using agricultural lime before planting."
-        },
-        "above": {
-            "Moderate": "The soil is slightly alkaline. Apply elemental sulfur to lower the pH.",
-            "Poor": "The soil is highly alkaline. Reduce the soil pH before cultivation using suitable amendments."
-        }
-    }
-}
-
-_PARAMETER_DISPLAY_NAMES: Dict[str, str] = {
+_PARAMETER_LABELS: Dict[str, str] = {
     "nitrogen": "Nitrogen",
     "phosphorus": "Phosphorus",
     "potassium": "Potassium",
-    "ph": "Soil pH",
-    
+    "ph": "pH",
 }
 
+_STRONG_RATINGS = {"Excellent", "Good"}
+_WEAK_RATINGS = {"Moderate", "Poor"}
 
-def generate_summary(parameter_scores: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
-    """
-    Dynamically generate a human-readable strengths/improvements summary
-    from actual parameter scoring results. No statements are hardcoded per
-    crop -- every sentence is derived from the real status of each parameter.
 
-    :param parameter_scores: Mapping of parameter name -> its scored dict
-        (must contain "status").
-    :return: Dict with "strengths" and "improvements" string lists.
+def _generate_summary(
+    parameter_scores: Dict[str, Dict[str, object]]
+) -> Dict[str, List[str]]:
+    """Build dynamic strengths and improvements for only the present parameters.
+
+    Args:
+        parameter_scores: Per-parameter scoring results for a crop.
+
+    Returns:
+        A dictionary with "strengths" and "improvements" string lists.
     """
     strengths: List[str] = []
     improvements: List[str] = []
 
-    for param_name, result in parameter_scores.items():
-        status = result["status"]
-        display_name = _PARAMETER_DISPLAY_NAMES.get(param_name, param_name.title())
+    for parameter_name, result in parameter_scores.items():
+        label = _PARAMETER_LABELS[parameter_name]
+        rating = result["rating"]
 
-        if status in ("Excellent", "Good"):
-            template = _STRENGTH_TEMPLATES.get(param_name, {}).get(status)
-            strengths.append(template or f"{display_name} is suitable for this crop.")
-        else:
-         comparison = result.get("comparison", "below")
-
-    template = (
-        _IMPROVEMENT_TEMPLATES
-        .get(param_name, {})
-        .get(comparison, {})
-        .get(status)
-    )
-
-    improvements.append(
-        template or f"Improve {display_name} to better match this crop's needs."
-    )
+        if rating in _STRONG_RATINGS:
+            strengths.append(f"{label} level is well suited to this crop.")
+        elif rating in _WEAK_RATINGS:
+            improvements.append(f"{label} level should be adjusted for better results.")
 
     return {"strengths": strengths, "improvements": improvements}
 
 
-# =============================================================================
-# CROP SCORING
-# =============================================================================
+# =====================================================================
+# RECOMMENDATION ASSEMBLY
+# =====================================================================
 
-def calculate_crop_score(
-    soil_data: Dict[str, float], crop_row: "pd.Series"
-) -> Tuple[Dict[str, Dict[str, Any]], float]:
+def _stars_for_score(score: float) -> int:
+    """Convert a 0-100 score into a 1-5 star rating.
+
+    Args:
+        score: The crop's overall weighted score.
+
+    Returns:
+        An integer star rating between 1 and 5, inclusive.
     """
-    Compute the full parameter-level scoring breakdown and total suitability
-    score for a single crop row.
+    stars = round(score / 20.0)
+    return max(1, min(5, stars))
 
-    :param soil_data: Validated soil parameter values.
-    :param crop_row: A single row (pandas Series) from the crop dataset.
-    :return: Tuple of (parameter_scores dict keyed by parameter name, total
-        overall score out of 100).
+
+def _format_range_bound(value: float) -> str:
+    """Format a numeric range bound, dropping a trailing ".0" when whole.
+
+    Args:
+        value: The numeric bound to format.
+
+    Returns:
+        A compact string representation, e.g. "20" instead of "20.0".
     """
-    parameter_scores: Dict[str, Dict[str, Any]] = {}
-    total_score = 0.0
-
-    for param_name, weight in PARAMETER_WEIGHTS.items():
-        min_col, max_col = PARAMETER_DATASET_COLUMNS[param_name]
-        min_val = float(crop_row[min_col])
-        max_val = float(crop_row[max_col])
-        value = soil_data[param_name]
-
-        result = score_parameter(value, min_val, max_val, weight)
-        parameter_scores[param_name] = result.to_dict()
-        total_score += result.score
-
-    return parameter_scores, total_score
-
-
-# =============================================================================
-# RECOMMENDATION OBJECT ASSEMBLY
-# =============================================================================
-
-def build_recommendation(
-    crop_row: "pd.Series",
-    parameter_scores: Dict[str, Dict[str, Any]],
-    total_score: float,
-) -> Dict[str, Any]:
-    """
-    Assemble the final recommendation object for a single crop, matching the
-    exact JSON schema required by the frontend.
-
-    :param crop_row: The crop dataset row this recommendation is built from.
-    :param parameter_scores: Output of calculate_crop_score's first element.
-    :param total_score: Output of calculate_crop_score's second element.
-    :return: A fully populated recommendation dict.
-    """
-    rounded_score = int(round(total_score))
-    rounded_score = max(0, min(100, rounded_score))
-
-    return {
-        "crop": str(crop_row["crop"]),
-        "score": rounded_score,
-        "stars": score_to_stars(rounded_score),
-        "match": score_to_match(rounded_score),
-        "confidence": score_to_confidence(rounded_score),
-        "parameter_scores": parameter_scores,
-        "recommended_environment": {
-            "soil_type": str(crop_row["soil_type"]),
-            "temperature": f"{_fmt_num(crop_row['temp_min'])}-{_fmt_num(crop_row['temp_max'])}°C",
-            "humidity": f"{_fmt_num(crop_row['humidity_min'])}-{_fmt_num(crop_row['humidity_max'])}%",
-            "rainfall": f"{_fmt_num(crop_row['rain_min'])}-{_fmt_num(crop_row['rain_max'])} mm/year",
-            "season": str(crop_row["season"]),
-        },
-        "summary": generate_summary(parameter_scores),
-    }
-
-
-def _fmt_num(value: Any) -> str:
-    """Format a numeric dataset value for display, dropping unneeded decimals."""
     numeric_value = float(value)
     if numeric_value.is_integer():
         return str(int(numeric_value))
-    return f"{numeric_value:.1f}"
+    return str(round(numeric_value, 1))
 
 
-# =============================================================================
-# PUBLIC ENTRY POINT
-# =============================================================================
+def _format_environment_range(crop_row: pd.Series, field_name: str) -> str:
+    """Format a derived environment field as a "min-max<unit>" string.
 
-def recommend_crops(
-    soil_data: Dict[str, Any], dataset_path: str = DEFAULT_DATASET_PATH
-) -> List[Dict[str, Any]]:
+    Args:
+        crop_row: The dataset row for the crop being evaluated.
+        field_name: One of "temperature", "humidity", or "rainfall".
+
+    Returns:
+        A formatted range string, e.g. "20-30°C" or "800-1200 mm/year".
     """
-    Compute the Top 5 most suitable crops for a given parsed soil report.
+    min_column, max_column, unit_suffix = _ENVIRONMENT_RANGE_COLUMNS[field_name]
+    lower_bound = _format_range_bound(crop_row[min_column])
+    upper_bound = _format_range_bound(crop_row[max_column])
+    return f"{lower_bound}-{upper_bound}{unit_suffix}"
 
-    This is the single public entry point intended to be called by the
-    Flask route layer. It performs validation, scoring, deduplication
-    (a crop may appear under multiple soil_type rows -- only its
-    highest-scoring variant is returned), ranking, and truncation to the
-    top N results.
 
-    :param soil_data: The parser's output, expected to contain a
-        "soil_parameters" dict (or the flat parameter keys directly).
-    :param dataset_path: Path to the master crop dataset CSV.
-    :return: List of up to TOP_N_RESULTS recommendation dicts, sorted by
-        score descending.
-    :raises SoilDataValidationError: If soil_data fails validation.
-    :raises DatasetError: If the crop dataset cannot be loaded or is invalid.
+def _build_environment(crop_row: pd.Series) -> Dict[str, str]:
+    """Derive a crop's recommended growing environment from dataset ranges.
+
+    Temperature, humidity, and rainfall are computed from their
+    respective min/max dataset columns; soil type and season are
+    copied directly.
+
+    Args:
+        crop_row: The dataset row for the crop being evaluated.
+
+    Returns:
+        A dictionary of environment attributes as display-ready strings.
     """
-    validated_soil_data = validate_soil_data(soil_data)
-    dataset = load_crop_dataset(dataset_path)
-
-    best_recommendation_by_crop: Dict[str, Dict[str, Any]] = {}
-
-    for _, crop_row in dataset.iterrows():
-        try:
-            parameter_scores, total_score = calculate_crop_score(validated_soil_data, crop_row)
-        except (KeyError, TypeError, ValueError) as exc:
-            logger.warning(
-                "Skipping crop row '%s' (soil_type=%s) due to scoring error: %s",
-                crop_row.get("crop", "<unknown>"),
-                crop_row.get("soil_type", "<unknown>"),
-                exc,
-            )
-            continue
-
-        recommendation = build_recommendation(crop_row, parameter_scores, total_score)
-        crop_name = recommendation["crop"]
-
-        existing = best_recommendation_by_crop.get(crop_name)
-        if existing is None or recommendation["score"] > existing["score"]:
-            best_recommendation_by_crop[crop_name] = recommendation
-
-    ranked_recommendations = sorted(
-        best_recommendation_by_crop.values(),
-        key=lambda rec: rec["score"],
-        reverse=True,
-    )
-
-    return ranked_recommendations[:TOP_N_RESULTS]
-
-
-# =============================================================================
-# LOCAL TESTING / MANUAL VERIFICATION
-# =============================================================================
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    sample_soil_data = {
-    "soil_parameters": {
-        "nitrogen": 20,
-        "phosphorus": 10,
-        "potassium": 15,
-        "ph": 4.8,
-    
+    environment = {
+        field_name: _format_environment_range(crop_row, field_name)
+        for field_name in _ENVIRONMENT_RANGE_COLUMNS
     }
-}
+    environment.update(
+        {column: str(crop_row[column]) for column in _ENVIRONMENT_DIRECT_COLUMNS}
+    )
+    return environment
 
-    try:
-        top_recommendations = recommend_crops(
-            sample_soil_data, dataset_path=DEFAULT_DATASET_PATH
-        )
-        print(json.dumps(top_recommendations, indent=2, ensure_ascii=False))
-    except (SoilDataValidationError, DatasetError) as exc:
-        logger.error("Recommendation engine failed: %s", exc)
+
+def _assemble_crop_result(crop_score: CropScore) -> Dict[str, object]:
+    """Assemble a single crop's result dictionary matching the required schema.
+
+    Args:
+        crop_score: The scored result for one crop.
+
+    Returns:
+        A dictionary following the exact required output schema.
+    """
+    rounded_score = round(crop_score.overall_score)
+    match = _rating_for_score(crop_score.overall_score)
+
+    return {
+        "crop": crop_score.crop_name,
+        "score": rounded_score,
+        "stars": _stars_for_score(crop_score.overall_score),
+        "match": match,
+        "confidence": CONFIDENCE_BY_MATCH[match],
+        "parameter_scores": crop_score.parameter_scores,
+        "recommended_environment": _build_environment(crop_score.crop_row),
+        "summary": _generate_summary(crop_score.parameter_scores),
+    }
+
+
+# =====================================================================
+# PUBLIC ENTRYPOINT
+# =====================================================================
+
+def recommend_crops(soil_report_json: dict, dataset_path: str) -> List[Dict[str, object]]:
+    """Recommend the top matching crops for a given soil report.
+
+    This is the single public entrypoint of the recommendation engine
+    and is a drop-in replacement for the existing service: the
+    signature, parameter names, and return type are unchanged so the
+    FastAPI routes require no modification.
+
+    The engine is parameter agnostic: whatever subset of the supported
+    parameters (nitrogen, phosphorus, potassium, ph) is present in the
+    report is used, with weights dynamically renormalized so no report
+    is penalized for a parameter its laboratory did not measure.
+    Organic matter, while recognized by the parser, never participates
+    in scoring.
+
+    Args:
+        soil_report_json: The structured JSON produced by the existing
+            OCR / PDF / soil-report parser. This schema is not modified.
+        dataset_path: Filesystem path to the master crop dataset CSV.
+
+    Returns:
+        A list of up to five crop recommendation dictionaries, sorted
+        in descending order of match score, each following the schema:
+
+            {
+                "crop": str,
+                "score": int,
+                "stars": int,
+                "match": str,
+                "confidence": str,
+                "parameter_scores": {...},
+                "recommended_environment": {...},
+                "summary": {"strengths": [...], "improvements": [...]},
+            }
+
+    Raises:
+        FileNotFoundError: If the dataset file does not exist.
+        ValueError: If the dataset is missing required columns, or if
+            the soil report contains no valid supported parameters.
+    """
+    dataset = _load_dataset(dataset_path)
+
+    soil_values = _extract_available_parameters(soil_report_json)
+    normalized_weights = _normalize_weights(soil_values.keys())
+
+    all_crop_scores = _score_all_crops(dataset, soil_values, normalized_weights)
+    ranked_crop_scores = _deduplicate_and_rank(all_crop_scores)
+    top_crop_scores = ranked_crop_scores[:_TOP_N_RESULTS]
+
+    return [_assemble_crop_result(crop_score) for crop_score in top_crop_scores]

@@ -1,43 +1,105 @@
+import gc
+import logging
+import os
+import tempfile
+
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import easyocr
+import numpy as np
+from PIL import Image, ImageOps
 
-# Initialize EasyOCR Reader once when the application starts
-# Using CPU because CUDA is not available on your system.
-reader = easyocr.Reader(['en'])
+logger = logging.getLogger("ocr_services")
 
-def extract_text_from_images(image_paths):
-    """
-    Extract text from a list of image paths using EasyOCR.
+_reader = None
 
-    Parameters:
-        image_paths (list): List of image file paths.
+MAX_OCR_WIDTH = 1500
+
+
+def _get_reader() -> easyocr.Reader:
+    """Lazy-initialize EasyOCR reader on first use."""
+    global _reader
+    if _reader is None:
+        logger.info("Initializing EasyOCR reader (CPU mode)...")
+        _reader = easyocr.Reader(["en"], gpu=False)
+        logger.info("EasyOCR reader initialized.")
+    return _reader
+
+
+def _preprocess_image(image_path: str) -> str:
+    """Apply minimal preprocessing to improve OCR accuracy.
+
+    Converts to grayscale and applies simple thresholding. Avoids
+    creating multiple intermediate copies to keep memory usage low.
+
+    Args:
+        image_path: Path to the original image.
 
     Returns:
-        list: A list where each element contains the extracted text
-              from one image/page.
+        Path to the preprocessed temporary image.
     """
+    img = Image.open(image_path)
 
-    print("Entered extract_text_from_images()", flush=True)
+    try:
+        if img.width > MAX_OCR_WIDTH:
+            ratio = MAX_OCR_WIDTH / img.width
+            img = img.resize((MAX_OCR_WIDTH, int(img.height * ratio)), Image.LANCZOS)
 
-    extracted_pages = []
+        img = ImageOps.grayscale(img)
+
+        img = ImageOps.autocontrast(img, cutoff=1)
+
+        # Save to temp file
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.close()
+        img.save(tmp.name)
+    finally:
+        img.close()
+
+    return tmp.name
+
+
+def extract_text_from_images(image_paths: list[str]) -> list[str]:
+    """Extract text from a list of image paths using EasyOCR.
+
+    Args:
+        image_paths: List of image file paths.
+
+    Returns:
+        A list where each element contains the extracted text from one page.
+    """
+    reader = _get_reader()
+
+    extracted_pages: list[str] = []
 
     for image_path in image_paths:
+        logger.info("Processing image: %s", image_path)
 
-        print(f"Processing image: {image_path}", flush=True)
-
+        preprocessed_path = None
         try:
-            # detail=0 returns only the recognized text
-            result = reader.readtext(image_path, detail=0)
+            preprocessed_path = _preprocess_image(image_path)
 
-            print("OCR returned successfully", flush=True)
+            result = reader.readtext(
+                preprocessed_path,
+                detail=0,
+                paragraph=True,
+            )
 
             page_text = "\n".join(result)
-
             extracted_pages.append(page_text)
+            logger.info("OCR returned %d characters", len(page_text))
 
         except Exception as e:
-            print(f"OCR Error: {e}", flush=True)
+            logger.exception("OCR failed for %s", image_path)
             extracted_pages.append("")
 
-    print("Leaving extract_text_from_images()", flush=True)
+        finally:
+            if preprocessed_path and os.path.exists(preprocessed_path):
+                try:
+                    os.remove(preprocessed_path)
+                except OSError:
+                    pass
+            gc.collect()
 
     return extracted_pages

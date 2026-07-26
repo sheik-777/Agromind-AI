@@ -41,9 +41,10 @@ logger = logging.getLogger("parser_service")
 # Metadata fields are report bookkeeping, not chemical parameters, so their
 # aliases are not part of SOIL_PARAMETERS. They are declared here instead.
 METADATA_FIELDS: dict[str, list[str]] = {
+    "laboratory_name": ["laboratory name"],
     "lab_number": ["lab number", "lab no", "lab #"],
-    "account": ["account"],
-    "client": ["client"],
+    "account": ["account number", "account"],
+    "client": ["client name", "client"],
     "county": ["county"],
     "date_received": ["date received"],
     "date_processed": ["date processed"],
@@ -119,8 +120,10 @@ def _ocr_tolerant_similarity(candidate: str, target: str) -> float:
 
     OCR frequently drops the first character of a line (e.g. "Lab Number"
     becomes "ab Number"). This checks the direct similarity as well as the
-    similarity with either string's leading character stripped, and returns
-    the best score.
+    similarity with the candidate's leading character stripped (simulating
+    an OCR drop), and returns the best score. The target-leading-char
+    variant is NOT used because it creates false positives (e.g. "County"
+    matching "account" via target[1:] = "ccount").
 
     Args:
         candidate: Text extracted from OCR.
@@ -134,8 +137,6 @@ def _ocr_tolerant_similarity(candidate: str, target: str) -> float:
     scores = [_similarity(candidate_n, target_n)]
     if len(candidate_n) > 1:
         scores.append(_similarity(candidate_n[1:], target_n))
-    if len(target_n) > 1:
-        scores.append(_similarity(candidate_n, target_n[1:]))
     return max(scores)
 
 
@@ -161,10 +162,19 @@ def _classify_heading(line: str) -> Optional[str]:
     """
     combined = {**SECTION_HEADINGS, **RECOMMENDATION_HEADINGS}
     ordered_keys = sorted(combined, key=lambda k: len(combined[k]), reverse=True)
+
+    candidate_n = _normalize(line)
+
     for key in ordered_keys:
         phrase = combined[key]
+        phrase_n = _normalize(phrase)
+
+        if candidate_n.startswith(phrase_n):
+            return key
+
         if _ocr_tolerant_similarity(line, phrase) >= _FUZZY_LINE_THRESHOLD:
             return key
+
     return None
 
 
@@ -172,7 +182,9 @@ def _fuzzy_match_metadata_field(line: str) -> Optional[tuple[str, str]]:
     """Match a line against known metadata field labels, allowing inline values.
 
     Handles both "Label: value" and "Label value" forms, as well as the
-    OCR-dropped-leading-character case.
+    OCR-dropped-leading-character case. Prefers the longest alias match
+    across all fields to avoid short aliases (e.g. "lab") stealing matches
+    from longer, more specific ones (e.g. "lab number").
 
     Args:
         line: A cleaned OCR line.
@@ -182,17 +194,22 @@ def _fuzzy_match_metadata_field(line: str) -> Optional[tuple[str, str]]:
         start of the line, else None. remaining_value_text may be empty if
         the value is expected on a following line.
     """
+    best_match: Optional[tuple[str, str, int]] = None  # (field_key, remainder, alias_len)
+
     for field_key, aliases in METADATA_FIELDS.items():
         for alias in sorted(aliases, key=len, reverse=True):
-            # Try to find the alias near the start of the line (tolerant of a
-            # missing leading character) and split off whatever follows it.
             for probe_len in (len(alias), len(alias) - 1):
                 if probe_len <= 0:
                     continue
                 prefix = line[:probe_len]
                 if _ocr_tolerant_similarity(prefix, alias) >= _FUZZY_LINE_THRESHOLD:
                     remainder = line[probe_len:].lstrip(" :\t")
-                    return field_key, remainder
+                    if best_match is None or len(alias) > best_match[2]:
+                        best_match = (field_key, remainder, len(alias))
+                    break  # Don't try shorter probe_lens for this alias
+
+    if best_match is not None:
+        return best_match[0], best_match[1]
     return None
 
 
@@ -223,6 +240,103 @@ def _fuzzy_match_parameter(token: str) -> Optional[str]:
     if best_score >= threshold:
         return best_key
     return None
+
+
+def _fuzzy_match_parameter_prefix(token: str) -> Optional[str]:
+    """Match a parameter name at the start of a line, ignoring trailing text.
+
+    Like :func:`_fuzzy_match_parameter` but tolerates trailing characters
+    (e.g. ``"phosphorus 25 web copy"`` → ``"phosphorus"``).  This is used
+    by the inline fallback extractor where OCR merges header names with
+    values on the same line.
+    """
+    token_n = _normalize(token)
+    if not token_n:
+        return None
+
+    best_key: Optional[str] = None
+    best_score = 0.0
+    for key, definition in SOIL_PARAMETERS.items():
+        candidates = {key.replace("_", " ")} | set(definition["aliases"])
+        for alias in candidates:
+            if token_n.startswith(alias):
+                score = len(alias) / len(token_n)
+                if score > best_score:
+                    best_score = score
+                    best_key = key
+    if best_key and best_score >= 0.4:
+        return best_key
+    return None
+
+
+def _extract_inline_parameters(
+    block_lines: list[str],
+) -> list[dict[str, Any]]:
+    """Fallback extraction of parameter-value pairs from merged OCR lines.
+
+    When the structured vertical-table parser fails, this function scans
+    block lines to collect parameter headers and numeric values, then
+    matches them up.  It handles both merged lines like
+    "Phosphorus [P] (ppm) 25" and separated layouts like "pH\\n6.2".
+
+    Returns:
+        A single-element list with one sample dict containing all
+        extracted parameters, or an empty list if nothing was found.
+    """
+    headers: list[tuple[str, Optional[float]]] = []
+    standalone_values: list[float] = []
+    seen_keys: set[str] = set()
+
+    for line in block_lines:
+        stripped = line.strip()
+        upper = stripped.upper()
+
+        if (
+            not stripped
+            or stripped.upper() == "WEB COPY"
+            or upper == "PAGE"
+            or _classify_heading(stripped) is not None
+            or _ocr_tolerant_similarity(stripped, _SAMPLE_LABEL)
+            >= _FUZZY_LINE_THRESHOLD
+        ):
+            continue
+
+        param_key = _fuzzy_match_parameter(stripped)
+        if param_key is None:
+            param_key = _fuzzy_match_parameter_prefix(stripped)
+        if param_key is not None and param_key not in seen_keys:
+            numbers = _extract_numbers(stripped)
+            inline_value = numbers[0] if numbers else None
+            headers.append((param_key, inline_value))
+            seen_keys.add(param_key)
+        elif not param_key:
+            numbers = _extract_numbers(stripped)
+            standalone_values.extend(numbers)
+
+    standalone_iter = iter(standalone_values)
+    params: list[dict[str, Any]] = []
+
+    for param_key, inline_value in headers:
+        value: Optional[float] = inline_value
+        if value is None:
+            value = next(standalone_iter, None)
+        if value is None:
+            continue
+
+        definition = SOIL_PARAMETERS[param_key]
+        params.append(
+            {
+                "parameter": param_key,
+                "display_name": definition["display_name"],
+                "original_name": param_key.replace("_", " "),
+                "value": value,
+                "unit": definition.get("unit", ""),
+            }
+        )
+
+    if params:
+        return [{"sample_id": "1", "parameters": params}]
+    return []
 
 
 def _extract_numbers(line: str) -> list[float]:
@@ -262,6 +376,9 @@ def _extract_metadata(lines: list[str], warnings: list[str]) -> dict[str, Any]:
     metadata: dict[str, str] = {key: "" for key in METADATA_FIELDS}
 
     for idx, line in enumerate(lines):
+        # Skip section/recommendation headings — these are not metadata
+        if _classify_heading(line) is not None:
+            continue
         match = _fuzzy_match_metadata_field(line)
         if not match:
             continue
@@ -421,9 +538,9 @@ def _split_vertical_header_and_data(
                 f"laboratory analysis header token '{line}' did not match any "
                 "known parameter"
             )
-
     # Reached the end of the block while still reading headers: no data rows.
     return columns, len(block_lines)
+
 
 def _is_valid_lab_row(
     row_tokens: list[str],
@@ -462,6 +579,11 @@ def _parse_laboratory_analysis_block(
         return [], []
 
     columns, data_start_idx = _split_vertical_header_and_data(block_lines, warnings)
+
+    # Ensure sample column is always first so data row alignment is correct.
+    sample_cols = [c for c in columns if c["role"] == "sample"]
+    other_cols = [c for c in columns if c["role"] != "sample"]
+    columns = sample_cols + other_cols
 
     unknown_parameters = [
         {"header": col["original_name"]}
@@ -590,13 +712,25 @@ def _extract_laboratory_analysis(
         heading = _classify_heading(lines[idx])
         if heading == "laboratory_analysis":
             found_any = True
-            # Collect lines until the next heading.
-            block: list[str] = []
+
+            heading_n = _normalize(SECTION_HEADINGS["laboratory_analysis"])
+            remainder = _normalize(lines[idx])
+            if remainder.startswith(heading_n):
+                trailing = remainder[len(heading_n):].lstrip()
+                if trailing:
+                    block = [trailing]
+                else:
+                    block = []
+            else:
+                block = []
+
             cursor = idx + 1
             while cursor < len(lines) and _classify_heading(lines[cursor]) is None:
                 block.append(lines[cursor])
                 cursor += 1
             samples, unknown = _parse_laboratory_analysis_block(block, warnings)
+            if not samples:
+                samples = _extract_inline_parameters(block)
             all_samples.extend(samples)
             all_unknown.extend(unknown)
             idx = cursor
@@ -660,12 +794,24 @@ def _parse_interpretation_block(
         if param_key is not None and idx + 1 < len(block_lines):
             next_line = block_lines[idx + 1]
             breakpoints = _extract_numbers(next_line)
+            definition = SOIL_PARAMETERS[param_key]
             if breakpoints:
-                definition = SOIL_PARAMETERS[param_key]
                 parameters[param_key] = {
                     "display_name": definition["display_name"],
                     "original_name": line,
                     "breakpoints": breakpoints,
+                    "label": None,
+                }
+                idx += 2
+                continue
+            # Fallback: qualitative label (e.g. "Optimum", "High", "Low")
+            label_text = next_line.strip() if next_line.strip() else None
+            if label_text and not _fuzzy_match_parameter(label_text):
+                parameters[param_key] = {
+                    "display_name": definition["display_name"],
+                    "original_name": line,
+                    "breakpoints": [],
+                    "label": label_text,
                 }
                 idx += 2
                 continue

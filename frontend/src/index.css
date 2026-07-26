@@ -1,0 +1,167 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-primary: #1a3a2e;
+    --color-primary-light: #2d5a45;
+    --color-primary-dark: #0f2418;
+    --color-secondary: #10b981;
+    --color-secondary-light: #34d399;
+    --color-secondary-dark: #059669;
+    --color-accent: #84cc16;
+    --color-accent-light: #a3e635;
+    --color-accent-dark: #65a30d;
+    --color-warm: #a16207;
+    --color-warm-light: #d97706;
+    --color-warm-dark: #854d0e;
+    --color-earth: #78716c;
+    --color-earth-light: #a8a29e;
+    --color-earth-dark: #57534e;
+    --color-background: #fafafa;
+    --color-surface: #ffffff;
+    --color-surface-elevated: #ffffff;
+    --color-text: #18181b;
+    --color-text-secondary: #52525b;
+    --color-text-muted: #a1a1aa;
+    --color-border: #e4e4e7;
+    --color-border-light: #f4f4f5;
+  }
+
+  .dark {
+    --color-background: #09090b;
+    --color-surface: #18181b;
+    --color-surface-elevated: #27272a;
+    --color-text: #fafafa;
+    --color-text-secondary: #a1a1aa;
+    --color-text-muted: #71717a;
+    --color-border: #3f3f46;
+    --color-border-light: #27272a;
+  }
+
+  * {
+    border-color: var(--color-border);
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-text);
+    font-family: 'Inter', system-ui, sans-serif;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  :focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--color-background), 0 0 0 4px var(--color-primary);
+  }
+
+  ::selection {
+    background-color: rgba(26, 58, 46, 0.2);
+    color: var(--color-primary);
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-border);
+    border-radius: 9999px;
+    border: 2px solid var(--color-background);
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-text-muted);
+  }
+}
+
+@layer components {
+  .glass {
+    background: rgba(255, 255, 255, 0.8);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid rgba(228, 228, 231, 0.5);
+  }
+  .dark .glass {
+    background: rgba(24, 24, 27, 0.8);
+    border-color: rgba(63, 63, 70, 0.5);
+  }
+
+  .glass-strong {
+    background: rgba(255, 255, 255, 0.9);
+    backdrop-filter: blur(48px);
+    -webkit-backdrop-filter: blur(48px);
+    border: 1px solid rgba(228, 228, 231, 0.3);
+  }
+  .dark .glass-strong {
+    background: rgba(24, 24, 27, 0.9);
+    border-color: rgba(63, 63, 70, 0.3);
+  }
+
+  .glass-dark {
+    background: rgba(255, 255, 255, 0.8);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid rgba(228, 228, 231, 0.4);
+  }
+  .dark .glass-dark {
+    background: rgba(39, 39, 42, 0.8);
+    border-color: rgba(63, 63, 70, 0.4);
+  }
+
+  .animate-in {
+    animation: animateIn 0.6s ease-out forwards;
+  }
+  .animate-in-delay-1 { animation-delay: 100ms; }
+  .animate-in-delay-2 { animation-delay: 200ms; }
+  .animate-in-delay-3 { animation-delay: 300ms; }
+  .animate-in-delay-4 { animation-delay: 400ms; }
+  .animate-in-delay-5 { animation-delay: 500ms; }
+
+  @keyframes animateIn {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .animate-shimmer {
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+    background-size: 200% 100%;
+    animation: shimmer 2s infinite;
+  }
+  .dark .animate-shimmer {
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.05), transparent);
+  }
+
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+.recharts-tooltip-wrapper {
+  z-index: 1000;
+}

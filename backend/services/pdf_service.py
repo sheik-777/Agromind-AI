@@ -1,10 +1,18 @@
+import logging
 import os
+
 import fitz  # PyMuPDF
 
+logger = logging.getLogger("pdf_service")
 
-def convert_pdf_to_images(pdf_path: str, output_folder: str):
-    """
-    Convert every page of a PDF into PNG images.
+TARGET_DPI = 200
+
+
+def convert_pdf_to_images(pdf_path: str, output_folder: str) -> list[str]:
+    """Convert every page of a PDF into PNG images at 200 DPI.
+
+    200 DPI is sufficient for document OCR while keeping memory usage
+    manageable (~5.5 MB per A4 page vs ~13 MB at 300 DPI).
 
     Args:
         pdf_path: Path to the uploaded PDF.
@@ -13,30 +21,20 @@ def convert_pdf_to_images(pdf_path: str, output_folder: str):
     Returns:
         A list containing the paths of all generated images.
     """
-
-    # Create the output folder if it doesn't exist
     os.makedirs(output_folder, exist_ok=True)
 
-    # Open the PDF
-    pdf_document = fitz.open(pdf_path)
+    image_paths: list[str] = []
 
-    image_paths = []
+    with fitz.open(pdf_path) as pdf_document:
+        for page_number in range(len(pdf_document)):
+            page = pdf_document.load_page(page_number)
 
-    # Convert each page
-    for page_number in range(len(pdf_document)):
-        page = pdf_document.load_page(page_number)
+            pix = page.get_pixmap(dpi=TARGET_DPI)
 
-        pix = page.get_pixmap(dpi=150)
+            image_path = os.path.join(output_folder, f"page_{page_number + 1}.png")
+            pix.save(image_path)
+            image_paths.append(image_path)
 
-        image_path = os.path.join(
-            output_folder,
-            f"page_{page_number + 1}.png"
-        )
-
-        pix.save(image_path)
-
-        image_paths.append(image_path)
-
-    pdf_document.close()
+    logger.info("Converted %d pages to images at %d DPI", len(image_paths), TARGET_DPI)
 
     return image_paths

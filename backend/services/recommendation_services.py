@@ -89,10 +89,12 @@ ORIGINAL_WEIGHTS: Dict[str, float] = {
 #: Physical plausibility limits used purely for input validation.
 #: Values outside these ranges are treated as invalid measurements
 #: rather than legitimate agronomic extremes.
+#: Aligned with SOIL_PARAMETERS valid_range to avoid silently dropping
+#: legitimate readings.
 PHYSICAL_LIMITS: Dict[str, Tuple[float, float]] = {
-    "nitrogen": (0.0, 1000.0),
-    "phosphorus": (0.0, 1000.0),
-    "potassium": (0.0, 2000.0),
+    "nitrogen": (0.0, 5000.0),
+    "phosphorus": (0.0, 2000.0),
+    "potassium": (0.0, 5000.0),
     "ph": (0.0, 14.0),
 }
 

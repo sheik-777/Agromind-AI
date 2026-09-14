@@ -42,6 +42,7 @@ class Field(Base):
     farm = relationship("Farm", back_populates="fields")
     devices = relationship("Device", back_populates="field", cascade="all, delete-orphan")
     readings = relationship("SensorReading", back_populates="field")
+    irrigation_events = relationship("IrrigationEvent", back_populates="field", cascade="all, delete-orphan")
 
 class Device(Base):
     __tablename__ = "devices"
@@ -53,6 +54,7 @@ class Device(Base):
 
     field = relationship("Field", back_populates="devices")
     readings = relationship("SensorReading", back_populates="device")
+    irrigation_events = relationship("IrrigationEvent", back_populates="device")
 
 class SensorReading(Base):
     __tablename__ = "sensor_readings"
@@ -68,3 +70,21 @@ class SensorReading(Base):
 
     device = relationship("Device", back_populates="readings")
     field = relationship("Field", back_populates="readings")
+
+
+class IrrigationEvent(Base):
+    __tablename__ = "irrigation_events"
+    id = Column(String, primary_key=True, default=lambda: uuid.uuid4().hex)
+    field_id = Column(String, ForeignKey("fields.id"), nullable=False, index=True)
+    device_id = Column(String, ForeignKey("devices.id"), nullable=True, index=True)
+    started_at = Column(DateTime, default=datetime.utcnow, index=True)
+    ended_at = Column(DateTime, nullable=True)
+    duration_minutes = Column(Integer, nullable=True)
+    volume_mm = Column(Float, nullable=True)
+    trigger = Column(String, nullable=True)  # scheduled, manual, sensor, weather
+    status = Column(String, default="completed")  # scheduled, running, completed, cancelled
+    reason = Column(Text, nullable=True)  # explanation for the decision
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    device = relationship("Device", back_populates="irrigation_events")
+    field = relationship("Field", back_populates="irrigation_events")

@@ -1,7 +1,13 @@
+import { lazy, Suspense } from 'react'
 import { motion } from 'framer-motion'
+import { useReducedMotion } from 'motion/react'
 import { Link } from 'react-router-dom'
+import { cn } from '@/lib/utils'
 import Button from '@/components/ui/Button'
 import Card from '@/components/ui/Card'
+import { useFieldHealth } from '@/hooks/useFieldHealth'
+
+const TreeCanvas = lazy(() => import('@/components/3d/TreeCanvas'))
 
 const features = [
   {
@@ -43,68 +49,90 @@ const item = {
 }
 
 export default function Landing() {
+  const health = useFieldHealth()
+  const reduceMotion = useReducedMotion() ?? false
+
   return (
     <div className="min-h-screen">
-      {/* Hero */}
-      <section className="relative overflow-hidden py-20 lg:py-32">
-        {/* Background gradient mesh */}
-        <div className="absolute inset-0 -z-10">
-          <div className="absolute top-0 left-1/4 w-96 h-96 bg-forest-400/10 rounded-full blur-3xl" />
-          <div className="absolute bottom-0 right-1/4 w-96 h-96 bg-emerald-400/10 rounded-full blur-3xl" />
-          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-leaf-400/5 rounded-full blur-3xl" />
+      {/* Hero — the tree is the environment, not a widget */}
+      <section className="relative overflow-hidden min-h-[660px] lg:min-h-[84vh] flex items-center">
+        {/* Full-bleed 3D grove */}
+        <div className="absolute inset-0">
+          <Suspense fallback={null}>
+            <TreeCanvas health={health} reducedMotion={reduceMotion} />
+          </Suspense>
         </div>
 
-        <motion.div
-          initial={{ opacity: 0, y: 30 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.8, ease: [0.22, 1, 0.36, 1] }}
-          className="text-center max-w-4xl mx-auto px-4"
-        >
+        {/* Blend washes: readability for copy, seamless melt into the page below */}
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-r from-[#fafafa] via-[#fafafa]/45 to-transparent dark:from-[#09090b] dark:via-[#09090b]/40 dark:to-transparent" />
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-[#fafafa] via-transparent to-transparent dark:from-[#09090b] dark:via-transparent" />
+
+        {/* Copy floats above the grove — fully pointer-transparent except controls,
+            so hover/orbit events reach the canvas everywhere else */}
+        <div className="relative w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-16 pointer-events-none">
           <motion.div
-            initial={{ opacity: 0, scale: 0.9 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ delay: 0.2, duration: 0.5 }}
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-forest-50 dark:bg-forest-950/30 border border-forest-200 dark:border-forest-800 mb-8"
+            initial={{ opacity: 0, y: 24 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.7, ease: [0.22, 1, 0.36, 1] }}
+            className="max-w-xl pointer-events-none"
           >
-            <span className="w-2 h-2 rounded-full bg-forest-500 animate-pulse" />
-            <span className="text-sm font-medium text-forest-700 dark:text-forest-400">
-              Powered by Advanced AI
-            </span>
+            <p className="text-xs font-semibold tracking-[0.2em] text-forest-600 dark:text-forest-400 mb-5">
+              INTELLIGENT AGRICULTURE SYSTEM
+            </p>
+
+            <h1 className="text-5xl md:text-6xl font-bold tracking-tight font-display mb-6">
+              <span className="text-neutral-900 dark:text-white">Grow with </span>
+              <span className="text-forest-700 dark:text-forest-400">intelligence.</span>
+            </h1>
+
+            <p className="text-lg text-neutral-600 dark:text-neutral-400 max-w-lg mb-8 leading-relaxed">
+              AgroMind connects soil intelligence, real-time field sensing, computer vision and
+              AI-driven recommendations into one living view of your farm.
+            </p>
+
+            <div className="flex flex-col sm:flex-row sm:items-center gap-4 mb-8">
+              <Link to="/analyze" className="pointer-events-auto">
+                <Button size="lg" className="text-base px-8">
+                  Analyze My Soil
+                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
+                  </svg>
+                </Button>
+              </Link>
+              <a href="#how-it-works" className="pointer-events-auto">
+                <Button variant="outline" size="lg" className="text-base px-8">
+                  Explore AgroMind
+                </Button>
+              </a>
+            </div>
+
+            <div
+              className="pointer-events-auto flex items-center gap-3 rounded-2xl border border-neutral-200 dark:border-neutral-800 bg-white/70 dark:bg-neutral-900/70 backdrop-blur-sm px-4 py-3 max-w-lg"
+              title={health.detail}
+            >
+              <span
+                className={cn(
+                  'w-2.5 h-2.5 rounded-full flex-shrink-0',
+                  health.status === 'warning' ? 'bg-amber-500' : 'bg-forest-500'
+                )}
+              />
+              <div>
+                <p className="text-sm font-medium text-neutral-900 dark:text-white">
+                  Field status: {health.label}
+                </p>
+                <p className="text-xs text-neutral-500 dark:text-neutral-400">{health.detail}</p>
+              </div>
+            </div>
           </motion.div>
+        </div>
 
-          <h1 className="text-5xl md:text-6xl lg:text-7xl font-bold tracking-tight font-display mb-6">
-            <span className="text-neutral-900 dark:text-white">Grow Smarter,</span>
-            <br />
-            <span className="bg-gradient-to-r from-forest-600 via-emerald-500 to-leaf-500 bg-clip-text text-transparent">
-              Harvest Better
-            </span>
-          </h1>
-
-          <p className="text-lg md:text-xl text-neutral-600 dark:text-neutral-400 max-w-2xl mx-auto mb-10 leading-relaxed">
-            Upload your soil lab report and get AI-powered analysis, personalized crop recommendations,
-            and actionable farming insights in seconds.
-          </p>
-
-          <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-            <Link to="/analyze">
-              <Button size="lg" className="text-base px-8">
-                Analyze Your Soil
-                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
-                </svg>
-              </Button>
-            </Link>
-            <Link to="/crops">
-              <Button variant="outline" size="lg" className="text-base px-8">
-                Browse Crops
-              </Button>
-            </Link>
-          </div>
-        </motion.div>
+        <p className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 px-4 text-center text-xs text-neutral-500 dark:text-neutral-400">
+          Hover the tree — flowers bloom around your cursor · Drag to look around
+        </p>
       </section>
 
       {/* How it works */}
-      <section className="py-20 lg:py-32">
+      <section id="how-it-works" className="py-20 lg:py-32 scroll-mt-20">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <motion.div
             initial={{ opacity: 0, y: 20 }}
@@ -205,7 +233,7 @@ export default function Landing() {
                   Ready to Transform Your Farm?
                 </h2>
                 <p className="text-lg text-neutral-600 dark:text-neutral-400 mb-8 max-w-xl mx-auto">
-                  Join thousands of farmers making data-driven decisions with AgroMind.
+                  Upload a lab report to see what your soil is really telling you.
                 </p>
                 <Link to="/analyze">
                   <Button size="lg" className="text-base px-10">

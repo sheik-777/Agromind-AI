@@ -16,6 +16,10 @@
     --color-warm: #a16207;
     --color-warm-light: #d97706;
     --color-warm-dark: #854d0e;
+    --color-success: #16a34a;
+    --color-warning: #d97706;
+    --color-danger: #dc2626;
+    --color-info: #0284c7;
     --color-earth: #78716c;
     --color-earth-light: #a8a29e;
     --color-earth-dark: #57534e;
@@ -30,6 +34,10 @@
   }
 
   .dark {
+    --color-success: #4ade80;
+    --color-warning: #fbbf24;
+    --color-danger: #f87171;
+    --color-info: #38bdf8;
     --color-background: #09090b;
     --color-surface: #18181b;
     --color-surface-elevated: #27272a;

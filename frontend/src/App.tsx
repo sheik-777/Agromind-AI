@@ -1,6 +1,6 @@
 import { lazy, Suspense } from 'react'
 import { Routes, Route, useLocation } from 'react-router-dom'
-import { AnimatePresence, motion } from 'framer-motion'
+import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import Layout from '@/components/layout/Layout'
 
 const Landing = lazy(() => import('@/pages/Landing'))
@@ -56,11 +56,20 @@ function PageLoader() {
 
 export default function App() {
   const location = useLocation()
+  const reduceMotion = useReducedMotion()
 
   return (
     <Layout>
       <AnimatePresence mode="wait">
         <Suspense fallback={<PageLoader />}>
+          <motion.main
+            key={location.pathname}
+            initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 26, scale: 0.99 }}
+            animate={reduceMotion ? { opacity: 1 } : { opacity: 1, y: 0, scale: 1 }}
+            exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: -16, scale: 0.995 }}
+            transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
+            style={{ transformPerspective: 1200 }}
+          >
           <Routes location={location} key={location.pathname}>
             <Route path="/" element={<Landing />} />
             <Route path="/analyze" element={<AnalyzeSoil />} />
@@ -71,6 +80,7 @@ export default function App() {
             <Route path="/assistant" element={<AskAgroMind />} />
             <Route path="*" element={<NotFound />} />
           </Routes>
+          </motion.main>
         </Suspense>
       </AnimatePresence>
     </Layout>

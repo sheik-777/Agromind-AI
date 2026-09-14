@@ -104,6 +104,10 @@ export default {
         secondary: '#10b981',
         accent: '#84cc16',
         warm: '#a16207',
+        success: '#16a34a',
+        warning: '#d97706',
+        danger: '#dc2626',
+        info: '#0284c7',
         background: '#fafafa',
         surface: '#ffffff',
         'surface-elevated': '#ffffff',
@@ -115,8 +119,8 @@ export default {
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],
-        display: ['Cal Sans', 'Inter', 'system-ui', 'sans-serif'],
-        mono: ['JetBrains Mono', 'monospace'],
+        display: ['Inter', 'system-ui', 'sans-serif'],
+        mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
       },
       fontSize: {
         'fluid-xs': 'clamp(0.75rem, 0.7rem + 0.25vw, 0.875rem)',
@@ -169,14 +173,7 @@ export default {
         'scale-out': 'scaleOut 0.3s ease-in forwards',
         'spin-slow': 'spin 3s linear infinite',
         'pulse-soft': 'pulse 3s ease-in-out infinite',
-        'bounce-soft': 'bounce 2s ease-in-out infinite',
-        'float': 'float 6s ease-in-out infinite',
         'shimmer': 'shimmer 2s linear infinite',
-        'counter': 'counter 2s ease-out forwards',
-        'progress': 'progress 1.5s ease-out forwards',
-        'draw': 'draw 1.5s ease-out forwards',
-        'wiggle': 'wiggle 1s ease-in-out infinite',
-        'heartbeat': 'heartbeat 1.5s ease-in-out infinite',
       },
       keyframes: {
         fadeIn: {
@@ -211,33 +208,9 @@ export default {
           '0%': { opacity: '1', transform: 'scale(1)' },
           '100%': { opacity: '0', transform: 'scale(0.95)' },
         },
-        float: {
-          '0%, 100%': { transform: 'translateY(0px)' },
-          '50%': { transform: 'translateY(-10px)' },
-        },
         shimmer: {
           '0%': { backgroundPosition: '-200% 0' },
           '100%': { backgroundPosition: '200% 0' },
-        },
-        counter: {
-          '0%': { opacity: '0', transform: 'translateY(10px)' },
-          '100%': { opacity: '1', transform: 'translateY(0)' },
-        },
-        progress: {
-          '0%': { width: '0%' },
-          '100%': { width: 'var(--progress-width)' },
-        },
-        draw: {
-          '0%': { strokeDashoffset: 'var(--stroke-length)' },
-          '100%': { strokeDashoffset: '0' },
-        },
-        wiggle: {
-          '0%, 100%': { transform: 'rotate(-3deg)' },
-          '50%': { transform: 'rotate(3deg)' },
-        },
-        heartbeat: {
-          '0%, 100%': { transform: 'scale(1)' },
-          '50%': { transform: 'scale(1.05)' },
         },
       },
       transitionDuration: {

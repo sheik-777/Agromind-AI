@@ -4,7 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import Button from '@/components/ui/Button'
 import Card from '@/components/ui/Card'
-import SeedToHarvestLoading from '@/components/loading/SeedToHarvestLoading'
+import SeedToMango3D from '@/components/loading/SeedToMango3D'
 import { api } from '@/services/api'
 
 const processingStages = [
@@ -107,7 +107,7 @@ export default function AnalyzeSoil() {
     return (
       <div className="min-h-[80vh] flex items-center justify-center">
         <Card variant="glass" className="w-full max-w-lg p-8">
-          <SeedToHarvestLoading currentStep={processingStage} />
+          <SeedToMango3D currentStep={processingStage} />
           <div className="mt-8">
             <div className="flex justify-between text-sm text-neutral-600 dark:text-neutral-400 mb-2">
               <span>Processing {selectedFile?.name}</span>

@@ -8,6 +8,10 @@ from backend.config.settings import (
 )
 
 from backend.api.auth import router as auth_router
+from backend.api.field import router as field_router
+from backend.api.ai import router as ai_router
+from backend.api.weather import router as weather_router
+from backend.config.database import init_db
 
 app = FastAPI(
     title=PROJECT_NAME,
@@ -15,8 +19,18 @@ app = FastAPI(
     description=DESCRIPTION,
 )
 
+@app.on_event("startup")
+def on_startup():
+    try:
+        init_db()
+    except Exception:
+        pass
+
 app.include_router(auth_router)
 app.include_router(soil_router)
+app.include_router(field_router)
+app.include_router(ai_router)
+app.include_router(weather_router)
 
 @app.get("/")
 def home():

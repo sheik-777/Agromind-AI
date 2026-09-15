@@ -13,6 +13,7 @@ from backend.api.ai import router as ai_router
 from backend.api.weather import router as weather_router
 from backend.api.irrigation import router as irrigation_router
 from backend.api.image_analysis import router as image_analysis_router
+from backend.api.crops import router as crops_router
 from backend.config.database import init_db
 
 app = FastAPI(
@@ -35,6 +36,7 @@ app.include_router(ai_router)
 app.include_router(weather_router)
 app.include_router(irrigation_router)
 app.include_router(image_analysis_router)
+app.include_router(crops_router)
 
 @app.get("/")
 def home():

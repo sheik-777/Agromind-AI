@@ -67,6 +67,39 @@ class ApiClient {
   }
 
   onUploadProgress?: (progress: number) => void
+
+  async getCrops(params: CropListParams): Promise<CropListResponse> {
+    const searchParams = new URLSearchParams()
+    if (params.page) searchParams.set('page', String(params.page))
+    if (params.limit) searchParams.set('limit', String(params.limit))
+    if (params.search) searchParams.set('search', params.search)
+    if (params.soil_type) searchParams.set('soil_type', params.soil_type)
+    if (params.season) searchParams.set('season', params.season)
+    if (params.sort) searchParams.set('sort', params.sort)
+    if (params.order) searchParams.set('order', params.order)
+    const response = await this.client.get<CropListResponse>(`/crops?${searchParams.toString()}`)
+    return response.data
+  }
+
+  async getCropStats(): Promise<CropStatsResponse> {
+    const response = await this.client.get<CropStatsResponse>('/crops/stats')
+    return response.data
+  }
+
+  async getCropDetail(cropName: string): Promise<CropDetail> {
+    const response = await this.client.get<CropDetail>(`/crops/${encodeURIComponent(cropName)}`)
+    return response.data
+  }
+
+  async getCropCompatibility(cropName: string): Promise<CropCompatibility> {
+    const response = await this.client.get<CropCompatibility>(`/crops/${encodeURIComponent(cropName)}/compatibility`)
+    return response.data
+  }
+
+  async askAgroMind(payload: { question: string; conversation?: { role: string; content: string }[] }): Promise<AiAskResponse> {
+    const response = await this.client.post<AiAskResponse>('/ai/ask', payload)
+    return response.data
+  }
 }
 
 export const api = new ApiClient()
@@ -167,4 +200,91 @@ export interface Environment {
 export interface Summary {
   strengths: string[]
   improvements: string[]
+}
+
+export interface CropListItem {
+  id: string
+  name: string
+  soil_type: string
+  season: string
+  ph_min: number
+  ph_max: number
+  temp_min: number
+  temp_max: number
+  humidity_min: number
+  humidity_max: number
+  rain_min: number
+  rain_max: number
+  nitrogen_min: number
+  nitrogen_max: number
+  phosphorus_min: number
+  phosphorus_max: number
+  potassium_min: number
+  potassium_max: number
+  moisture_min: number
+  moisture_max: number
+}
+
+export interface CropListParams {
+  page?: number
+  limit?: number
+  search?: string
+  soil_type?: string
+  season?: string
+  sort?: string
+  order?: string
+}
+
+export interface CropListResponse {
+  crops: CropListItem[]
+  total: number
+  page: number
+  limit: number
+  total_pages: number
+}
+
+export interface CropStatsResponse {
+  total_records: number
+  unique_crops: number
+  soil_types: { name: string; count: number }[]
+  seasons: { name: string; count: number }[]
+  columns: string[]
+}
+
+export interface CropDetail {
+  id: string
+  name: string
+  soil_type: string
+  season: string
+  nitrogen: { min: number; max: number }
+  phosphorus: { min: number; max: number }
+  potassium: { min: number; max: number }
+  ph: { min: number; max: number }
+  temperature: { min: number; max: number }
+  humidity: { min: number; max: number }
+  rainfall: { min: number; max: number }
+  moisture: { min: number; max: number }
+}
+
+export interface CropCompatibility {
+  crop_name: string
+  compatibility_score: number
+  matched: string[]
+  constraints: string[]
+  scores: Record<string, number | null>
+  field_used: boolean
+}
+
+export interface AiAskResponse {
+  answer: string
+  intent: string
+  confidence: string
+  answer_mode: string
+  field_context_used: boolean
+  crop_context_used: boolean
+  weather_context_used: boolean
+  observed: string[]
+  sources: { title: string; source: string; url?: string }[]
+  warning?: string
+  llm?: { configured: boolean; provider?: string; model?: string } | null
 }

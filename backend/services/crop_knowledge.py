@@ -19,7 +19,7 @@ import re
 
 DATASET_PATH = "backend/datasets/agromind_master_dataset_full (1).csv"
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class CropRequirement:
     """Normalized crop requirement from dataset."""
     crop: str
